@@ -10,6 +10,6 @@ __DEFAULT_ALLOWED_COLORS__ = [
 ]
 
 __BLOCKS_IN_RANGE_MAXIMUM__ = int(os.environ.get("API_BLOCKS_IN_RANGE_MAXIMUM", "1000000"))
-__ALLOWED_COLORS__ = os.environ.get(
+__ALLOWED_COLORS__ = list(os.environ.get(
     "API_ALLOWED_COLORS",
-    ",".join(__DEFAULT_ALLOWED_COLORS__)).replace(" ", "").strip(",")
+    ",".join(__DEFAULT_ALLOWED_COLORS__)).replace(" ", "").strip(",")) + [None]

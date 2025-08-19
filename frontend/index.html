@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8"/>
+  <title>MapLibre GL 全球格網（米制正方 WebMercator）</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <link href="https://unpkg.com/maplibre-gl@3.6.1/dist/maplibre-gl.css" rel="stylesheet"/>
+  <style>
+    html, body {height:100%;margin:0}
+    #map {position:relative;height:100%}
+    .hud{position:absolute;top:10px;left:10px;z-index:10;background:#fff;padding:6px 8px;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,.15);font:14px/1.4 system-ui;display:flex;gap:8px;align-items:center}
+    .hud input{width:7em}
+  </style>
+</head>
+<body>
+<div id="map"></div>
+<div class="hud">
+  <span>STEP(°)：<input id="step" type="number" step="0.0001" value="0.0001" /></span>
+  <button id="clearSel">清空選中</button>
+  <button id="listCells">列出可視格</button>
+  <span>縮放：<span id="zoom">-</span></span>
+</div>
+<script src="https://unpkg.com/maplibre-gl@3.6.1/dist/maplibre-gl.js"></script>
+<script>
+// ====== 配置 ======
+const BACKEND_URI = "http://localhost:8000";
+const API_BASE = `${BACKEND_URI}/block`;
+let STEP = 0.0001;                 // 後端 /config 同步
+let allowed_colors = [];            // 後端允許色板（可選）
+let map;
+let selectedFC = { type:"FeatureCollection", features: [] };
+
+async function loadConfig(){
+  try{
+    const res = await fetch(`${BACKEND_URI}/config`);
+    if(!res.ok) throw new Error("config http error");
+    const cfg = await res.json();
+    if(cfg.STEP) STEP = cfg.STEP;
+    if(Array.isArray(cfg.allowed_colors)) allowed_colors = cfg.allowed_colors;
+    document.getElementById("step").value = STEP;
+  }catch(err){ console.warn("讀取 /config 失敗，使用預設", err); }
+}
+
+// ====== Mercator 轉換與格網計算（米制正方） ======
+const R = 6378137;
+const PI = Math.PI;
+function metersPerDegLat(){ return PI * R / 180; }
+function stepMeters(){ return STEP * metersPerDegLat(); }
+function lngToX(lng){ return R * (lng * PI/180); }
+function latToY(lat){ return R * Math.log(Math.tan(PI/4 + (lat*PI/180)/2)); }
+function xToLng(x){ return (x / R) * 180/PI; }
+function yToLat(y){ return (2*Math.atan(Math.exp(y/R)) - PI/2) * 180/PI; }
+
+function cellBounds(lng, lat){
+  const sm = stepMeters();
+  const x = lngToX(lng);
+  const y = latToY(lat);
+  const half = PI*R; // wrap
+  const westM  = Math.floor((x + half) / sm) * sm - half;
+  const southM = Math.floor((y + half) / sm) * sm - half;
+  const eastM  = westM + sm;
+  const northM = southM + sm;
+  return { west: xToLng(westM), east: xToLng(eastM), south: yToLat(southM), north: yToLat(northM) };
+}
+
+function boundsToPolygon(b, color){
+  return {
+    type:"Feature",
+    properties:{ color: color || "#ff3344" },
+    geometry:{ type:"Polygon", coordinates:[[
+      [b.west, b.south], [b.west, b.north], [b.east, b.north], [b.east, b.south], [b.west, b.south]
+    ]]}
+  };
+}
+
+// ====== 索引與 block_id（與後端一致） ======
+function coordToIndex(v){ return Math.floor(v / STEP); }
+function pad5(n){ const s = Math.abs(n).toString().padStart(5,'0'); return (n<0?'-':'') + s; }
+function toBlockId(ix, iy){ return `${pad5(ix)}#${pad5(iy)}`; }
+function blockIdFromBounds(b){ const ix = coordToIndex(b.west); const iy = coordToIndex(b.south); return toBlockId(ix, iy); }
+
+// ====== 後端 API ======
+async function apiPlace(block_id, metadata){
+  const r = await fetch(`${API_BASE}/place?block_id=${encodeURIComponent(block_id)}`,{
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(metadata)
+  });
+  if(!r.ok) throw new Error(`place failed ${r.status}`);
+  return r.json();
+}
+async function apiRange(x1, y1, x2, y2){
+  const p = new URLSearchParams({ x1: String(x1), y1: String(y1), x2: String(x2), y2: String(y2) });
+  const r = await fetch(`${API_BASE}/range?${p.toString()}`);
+  if(!r.ok) throw new Error(`range failed ${r.status}`);
+  return r.json();
+}
+
+// ====== 地圖初始化與互動 ======
+function init(){
+  map = new maplibregl.Map({
+    container:"map",
+    style:{
+      version:8,
+      sources:{ osm:{ type:"raster", tiles:["https://tile.openstreetmap.org/{z}/{x}/{y}.png"], tileSize:256, attribution:"© OpenStreetMap contributors" } },
+      layers:[ { id:"osm", type:"raster", source:"osm" } ]
+    },
+    center:[139.767125, 35.681236], zoom:5
+  });
+
+  try{ map.setProjection({name:"globe"}); }catch(e){ console.warn("globe 投影不可用，使用墨卡托"); }
+
+  map.on("load", ()=>{
+    map.addSource("hover-cell", { type:"geojson", data:{ type:"FeatureCollection", features: [] } });
+    map.addLayer({ id:"hover-outline", type:"line", source:"hover-cell", paint:{ "line-color":"#0077ff", "line-width":2 } });
+
+    map.addSource("selected-cells", { type:"geojson", data: selectedFC });
+    map.addLayer({ id:"selected-fill", type:"fill", source:"selected-cells", paint:{ "fill-color":["get","color"], "fill-opacity":0.24 } });
+    map.addLayer({ id:"selected-outline", type:"line", source:"selected-cells", paint:{ "line-color":"#ff3344", "line-width":1 } });
+
+    const zoomBadge = document.getElementById("zoom");
+    const updateZoom = ()=>{ zoomBadge.textContent = map.getZoom().toFixed(2); };
+    updateZoom();
+    map.on("zoom", updateZoom);
+
+    document.getElementById("step").addEventListener("change", ()=>{ STEP = Math.max(1e-7, parseFloat(step.value)||STEP); });
+
+    document.getElementById("clearSel").addEventListener("click", ()=>{
+      selectedFC = { type:"FeatureCollection", features: [] };
+      map.getSource("selected-cells").setData(selectedFC);
+    });
+
+    document.getElementById("listCells").addEventListener("click", async ()=>{
+      const b = map.getBounds();
+      const x1 = b.getWest(), y1 = b.getSouth(), x2 = b.getEast(), y2 = b.getNorth();
+      try{
+        const list = await apiRange(x1, y1, x2, y2);
+        console.log("range blocks", list.length, list);
+        const next = { type: "FeatureCollection", features: [] };
+        for(const it of list){
+          const poly = boundsToPolygon(
+            { west: it.lon[0], east: it.lon[1], south: it.lat[0], north: it.lat[1] },
+            (it.metadata && it.metadata.color) || "#ff3344"
+          );
+          next.features.push(poly);
+        }
+        selectedFC = next;
+        map.getSource("selected-cells").setData(selectedFC);
+      }catch(err){ console.error("range error", err); }
+    });
+
+    map.on("mousemove", e=>{
+      const b = cellBounds(e.lngLat.lng, e.lngLat.lat);
+      map.getSource("hover-cell").setData({ type:"FeatureCollection", features:[ boundsToPolygon(b, "#0077ff") ] });
+    });
+
+    map.on("click", async e=>{
+      const b = cellBounds(e.lngLat.lng, e.lngLat.lat);
+      const block_id = blockIdFromBounds(b);
+      const color = allowed_colors[0] || "#ff3344";
+      try{
+        const saved = await apiPlace(block_id, { author: "frontend", color });
+        const fillColor = (saved && saved.metadata && saved.metadata.color) ? saved.metadata.color : color;
+        selectedFC.features.push(boundsToPolygon(b, fillColor));
+        map.getSource("selected-cells").setData(selectedFC);
+        console.log("placed", block_id, saved);
+      }catch(err){ console.error("place error", err); }
+    });
+  });
+}
+
+(async()=>{ await loadConfig(); init(); })();
+</script>
+</body>
+</html>
